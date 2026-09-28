@@ -4,6 +4,7 @@ import math
 
 import pytest
 
+from claude_code_proxy.config import CodexOrchestrationMode
 from claude_code_proxy.domain.models import TextDelta, TokenUsage, ToolInputDelta
 from claude_code_proxy.limits import MAX_CONTROL_INTEGER
 from claude_code_proxy.performance import (
@@ -13,6 +14,10 @@ from claude_code_proxy.performance import (
     SessionPerformance,
     SessionPerformanceSnapshot,
     _Aggregate,
+)
+from claude_code_proxy.providers.codex.orchestration_policy import (
+    OrchestrationDecision,
+    OrchestrationDecisionCode,
 )
 
 
@@ -362,6 +367,29 @@ def test_session_snapshot_is_deeply_immutable_and_copied() -> None:
         populated.requests = 2  # type: ignore[misc]
 
 
+def test_finalized_orchestration_dedupe_state_stays_bounded() -> None:
+    session = SessionPerformance("session-1")
+    decision = OrchestrationDecision(
+        CodexOrchestrationMode.ENFORCE,
+        OrchestrationDecisionCode.NESTED_ALLOWED,
+        Measurement.observed(1),
+        True,
+        True,
+    )
+
+    for index in range(500):
+        item = session_request(index)
+        session.start(item)
+        assert item.record_orchestration_decision(decision)
+        assert session.record_orchestration_decision(item)
+        finish_request(item, index)
+        assert session.add_finalized(item) is not None
+
+    assert session.snapshot(501.0).nested_allowed == 500
+    assert session._pending == {}
+    assert not hasattr(session, "_orchestration_requests")
+
+
 def test_session_snapshot_has_exact_safe_fields() -> None:
     expected = {
         "session_id",
@@ -378,6 +406,13 @@ def test_session_snapshot_has_exact_safe_fields() -> None:
         "retries",
         "current_concurrency",
         "peak_concurrency",
+        "nested_allowed",
+        "nested_denied",
+        "depth_limit_reached",
+        "lineage_unavailable",
+        "maximum_observed_depth",
+        "active_workers",
+        "revision_deduplication",
         "latest_request",
     }
 

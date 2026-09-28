@@ -39,6 +39,10 @@ class _FrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True)
 
 
+class _StrictFrozenModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
 def _require_wire_duration(value: object) -> object:
     if type(value) not in (int, float):
         raise ValueError("duration must be a JSON number")
@@ -57,6 +61,7 @@ class HealthResponse(_FrozenModel):
     started_at: datetime
     uptime_seconds: float
     capabilities: tuple[str, ...] = ("sessions", "agents")
+    orchestration_mode: Literal["off", "advisory", "enforce"] = "advisory"
     sessions: SessionCounts
     inactive_limit: NonNegativeControlInteger
 
@@ -139,6 +144,11 @@ SafeString = Annotated[
     Field(strict=True),
     AfterValidator(_require_safe_string),
 ]
+RawSessionId = Annotated[
+    str,
+    Field(strict=True, max_length=256),
+    AfterValidator(_require_safe_string),
+]
 TelemetryModelString = Annotated[
     str,
     Field(strict=True, max_length=TELEMETRY_MODEL_MAX_LENGTH),
@@ -177,6 +187,32 @@ FiniteDuration = Annotated[
     StrictNumber,
     AfterValidator(_require_finite_duration),
 ]
+OpaqueSessionId = Annotated[
+    str,
+    Field(strict=True, pattern=r"^[0-9a-f]{64}$"),
+]
+AuthorizationDepth = Annotated[int, Field(strict=True, ge=2, le=8)]
+AuthorizationDuration = Annotated[int, Field(strict=True, ge=1, le=86400)]
+
+
+class OrchestrationAuthorizationRequest(_StrictFrozenModel):
+    session_id: RawSessionId
+    max_depth: AuthorizationDepth
+    duration_seconds: AuthorizationDuration
+
+
+class OrchestrationRevocationRequest(_StrictFrozenModel):
+    session_id: RawSessionId
+
+
+class OrchestrationAuthorizationResponse(_StrictFrozenModel):
+    session_id: OpaqueSessionId
+    max_depth: AuthorizationDepth
+    remaining_seconds: FiniteDuration
+
+
+class OrchestrationAuthorizationListResponse(_StrictFrozenModel):
+    authorizations: tuple[OrchestrationAuthorizationResponse, ...]
 
 
 class _TelemetryModel(BaseModel):

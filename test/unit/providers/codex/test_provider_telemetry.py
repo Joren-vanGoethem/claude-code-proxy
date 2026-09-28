@@ -5,6 +5,7 @@ import logging
 import httpx
 import pytest
 
+from claude_code_proxy.config import CodexOrchestrationMode
 from claude_code_proxy.domain.models import (
     Message,
     RedactedThinkingBlock,
@@ -18,6 +19,13 @@ from claude_code_proxy.domain.models import (
     ToolUseBlock,
 )
 from claude_code_proxy.failures import FailureCategory, FailureDiagnostic, FailureStage
+from claude_code_proxy.public_identity import PublicIdentity
+from claude_code_proxy.providers.codex.orchestration_policy import (
+    OrchestrationPolicyCoordinator,
+)
+from claude_code_proxy.providers.codex.orchestration_registry import (
+    OrchestrationRegistry,
+)
 from claude_code_proxy.providers.codex.provider import CodexProvider
 from claude_code_proxy.providers.codex.reasoning import encode_reasoning
 from claude_code_proxy.reasoning import ReasoningPolicy
@@ -27,13 +35,68 @@ from test.unit.providers.codex.provider_test_support import (
     Client,
     EnterFailureContext,
     ExitClient,
+    RecordingOrchestration,
     RecordingTelemetry,
     Response,
     collect,
     completed_response,
+    orchestration_request,
     request,
     reset_client as reset_client,
 )
+
+
+async def test_orchestration_telemetry_runs_after_filtering_and_cannot_restore_agent():
+    identity = PublicIdentity(secret=b"secret")
+    coordinator = OrchestrationPolicyCoordinator(
+        CodexOrchestrationMode.ENFORCE,
+        identity,
+        OrchestrationRegistry(),
+    )
+
+    class FailingTelemetry(RecordingTelemetry):
+        def orchestration_decision(self, decision):
+            assert decision.agent_allowed is False
+            raise RuntimeError("sensitive telemetry failure")
+
+    Client.responses = [completed_response()]
+
+    events = await collect(
+        CodexProvider(Auth(), Client, orchestration=coordinator),
+        orchestration_request(agent_id="worker"),
+        telemetry=FailingTelemetry(),
+    )
+
+    payload = Client.requests[0][2]["json"]
+    assert all(tool["name"] != "Agent" for tool in payload["tools"])
+    assert events == [
+        StreamStart(),
+        StreamComplete("end_turn", TokenUsage(0, 0)),
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        asyncio.CancelledError(),
+        KeyboardInterrupt(),
+        SystemExit(),
+        GeneratorExit(),
+    ],
+)
+async def test_orchestration_telemetry_preserves_control_flow(failure):
+    class FailingTelemetry:
+        def mark_retries_supported(self):
+            pass
+
+        def set_reasoning_continuation(self, value):
+            pass
+
+        def orchestration_decision(self, decision):
+            raise failure
+
+    with pytest.raises(type(failure)):
+        await collect(CodexProvider(Auth(), Client), telemetry=FailingTelemetry())
 
 
 async def test_codex_telemetry_callback_failure_is_isolated(caplog):
@@ -116,21 +179,23 @@ async def test_stream_reports_original_request_before_reconciliation(
             reasoning=ReasoningPolicy(False, None),
         )
 
-    monkeypatch.setattr(
-        "claude_code_proxy.providers.codex.provider.reconcile_codex_request",
-        disable_reasoning,
-    )
+    orchestration = RecordingOrchestration(transform=disable_reasoning)
     Client.responses = [completed_response()]
 
     await collect(
-        CodexProvider(Auth(), Client),
+        CodexProvider(Auth(), Client, orchestration=orchestration),
         request(reasoning=ReasoningPolicy(True, "high")),
         telemetry=telemetry,
     )
 
-    assert telemetry.calls == [
+    assert telemetry.calls[:2] == [
         ("mark_retries_supported",),
         ("set_reasoning_continuation", "expected"),
+    ]
+    assert [call[0] for call in telemetry.calls] == [
+        "mark_retries_supported",
+        "set_reasoning_continuation",
+        "orchestration_decision",
     ]
 
 
@@ -144,9 +209,14 @@ async def test_stream_reports_capability_then_reasoning_once():
         telemetry=telemetry,
     )
 
-    assert telemetry.calls == [
+    assert telemetry.calls[:2] == [
         ("mark_retries_supported",),
         ("set_reasoning_continuation", "expected"),
+    ]
+    assert [call[0] for call in telemetry.calls] == [
+        "mark_retries_supported",
+        "set_reasoning_continuation",
+        "orchestration_decision",
     ]
 
 
@@ -159,9 +229,14 @@ async def test_complete_reports_adapter_facts_only_once():
         telemetry=telemetry,
     )
 
-    assert telemetry.calls == [
+    assert telemetry.calls[:2] == [
         ("mark_retries_supported",),
         ("set_reasoning_continuation", "expected"),
+    ]
+    assert [call[0] for call in telemetry.calls] == [
+        "mark_retries_supported",
+        "set_reasoning_continuation",
+        "orchestration_decision",
     ]
 
 
@@ -190,10 +265,11 @@ async def test_stream_reports_restored_reasoning_without_carrier_content():
         telemetry=telemetry,
     )
 
-    assert telemetry.calls[-1] == (
+    assert telemetry.calls.count((
         "set_reasoning_continuation",
         "restored",
-    )
+    )) == 1
+    assert telemetry.calls[-1][0] == "orchestration_decision"
     assert marker not in repr(telemetry.calls)
     assert carrier not in repr(telemetry.calls)
 
@@ -236,11 +312,13 @@ async def test_401_recovers_credentials_after_closing_response_and_retries_once(
         CodexProvider(auth, OrderedClient), telemetry=telemetry
     )
 
-    assert telemetry.calls == [
+    assert telemetry.calls[:2] == [
         ("mark_retries_supported",),
         ("set_reasoning_continuation", "not_applicable"),
-        ("record_retry",),
     ]
+    assert telemetry.calls[2][0] == "orchestration_decision"
+    assert telemetry.calls[3] == ("record_retry",)
+    assert len(telemetry.calls) == 4
     assert order == [
         "request_started",
         "credentials_recovered",
@@ -337,10 +415,12 @@ async def test_initial_credential_failure_returns_safe_structured_error():
         CodexProvider(auth, Client), telemetry=telemetry
     )
 
-    assert telemetry.calls == [
+    assert telemetry.calls[:2] == [
         ("mark_retries_supported",),
         ("set_reasoning_continuation", "not_applicable"),
     ]
+    assert telemetry.calls[2][0] == "orchestration_decision"
+    assert len(telemetry.calls) == 3
     assert Client.requests == []
     assert events == [
         StreamError(
@@ -395,29 +475,41 @@ async def test_recovery_failure_returns_safe_error_without_second_request():
 
 @pytest.mark.parametrize(
     "target",
-    ["reconcile_codex_request", "build_request"],
+    ["orchestration", "build_request"],
 )
 async def test_preparation_failure_still_reports_adapter_facts(
     monkeypatch, target
 ):
     telemetry = RecordingTelemetry()
+    error = RuntimeError("sensitive carrier must not leak")
+    orchestration = None
+    if target == "orchestration":
+        orchestration = RecordingOrchestration(failure=error)
+    else:
+        def fail_preparation(*args, **kwargs):
+            raise error
 
-    def fail_preparation(*args, **kwargs):
-        raise RuntimeError("sensitive carrier must not leak")
-
-    monkeypatch.setattr(
-        f"claude_code_proxy.providers.codex.provider.{target}",
-        fail_preparation,
-    )
+        monkeypatch.setattr(
+            "claude_code_proxy.providers.codex.provider.build_request",
+            fail_preparation,
+        )
 
     events = await collect(
-        CodexProvider(Auth(), Client), telemetry=telemetry
+        CodexProvider(Auth(), Client, orchestration=orchestration),
+        telemetry=telemetry,
     )
 
-    assert telemetry.calls == [
+    assert telemetry.calls[:2] == [
         ("mark_retries_supported",),
         ("set_reasoning_continuation", "not_applicable"),
     ]
+    expected_names = [
+        "mark_retries_supported",
+        "set_reasoning_continuation",
+    ]
+    if target == "build_request":
+        expected_names.append("orchestration_decision")
+    assert [call[0] for call in telemetry.calls] == expected_names
     assert "sensitive carrier" not in repr(events)
 
 

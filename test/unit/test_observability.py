@@ -6,6 +6,10 @@ import threading
 import pytest
 
 from claude_code_proxy.domain.models import ClientIdentity
+from claude_code_proxy.public_identity import PublicIdentity
+from claude_code_proxy.providers.codex.orchestration_registry import (
+    OrchestrationRegistry,
+)
 from claude_code_proxy.observability import (
     AmbiguousSessionId,
     InvalidSessionFilter,
@@ -27,6 +31,84 @@ def test_constructor_enforces_signed_64_inactive_limit() -> None:
 def test_constructor_rejects_negative_inactive_limit() -> None:
     with pytest.raises(ValueError, match="inactive_limit"):
         SessionRegistry(-1)
+
+
+def test_registry_accepts_shared_identity_and_rejects_secret_with_service() -> None:
+    identity = PublicIdentity(secret=b"shared-secret")
+    sessions = SessionRegistry(1, identity=identity)
+
+    assert sessions.public_id("session") == identity.public_id("session")
+    with pytest.raises(ValueError, match="secret.*identity"):
+        SessionRegistry(1, secret=b"secret", identity=identity)
+
+
+def test_inactive_eviction_callback_runs_outside_registry_lock() -> None:
+    evicted: list[str] = []
+    holder: dict[str, SessionRegistry] = {}
+
+    def on_evict(public_id: str) -> None:
+        evicted.append(public_id)
+        holder["sessions"].counts()
+
+    sessions = SessionRegistry(0, secret=b"secret", on_session_evicted=on_evict)
+    holder["sessions"] = sessions
+    handle = sessions.begin(metadata("evicted"))
+
+    sessions.finish(handle, "completed")
+
+    assert evicted == [handle.public_id]
+
+
+def test_delayed_eviction_cannot_remove_reactivated_orchestration_state() -> None:
+    identity = PublicIdentity(secret=b"shared-secret")
+    orchestration = OrchestrationRegistry()
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def delayed_cleanup(public_id: str, generation: int) -> None:
+        callback_entered.set()
+        assert release_callback.wait(timeout=5)
+        orchestration.remove_session_if_generation(public_id, generation)
+
+    sessions = SessionRegistry(
+        0,
+        identity=identity,
+        session_eviction_generation=orchestration.session_generation,
+        on_session_evicted=delayed_cleanup,
+    )
+    public_session = identity.public_id("same-session")
+    old_agent = identity.public_agent_id("same-session", "old-agent")
+    orchestration.observe_lineage(public_session, old_agent, None)
+    old = sessions.begin(metadata("same-session"))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        finished = executor.submit(sessions.finish, old, "completed")
+        assert callback_entered.wait(timeout=5)
+        sessions.begin(metadata("same-session"))
+        new_agent = identity.public_agent_id("same-session", "new-agent")
+        orchestration.observe_lineage(public_session, new_agent, None)
+        orchestration.authorize(public_session, max_depth=2, duration=60)
+        release_callback.set()
+        assert finished.result(timeout=5) is not None
+
+    assert orchestration.lineage(public_session, new_agent) is not None
+    assert orchestration.authorization(public_session).status == "active"
+
+
+def test_eviction_callback_never_reports_active_rows() -> None:
+    evicted: list[str] = []
+    sessions = SessionRegistry(
+        0,
+        secret=b"secret",
+        on_session_evicted=evicted.append,
+    )
+    active = sessions.begin(metadata("active"))
+    inactive = sessions.begin(metadata("inactive"))
+
+    sessions.finish(inactive, "completed")
+
+    assert evicted == [inactive.public_id]
+    assert active.public_id not in evicted
 
 
 def test_agents_share_root_aggregate_but_keep_independent_counts() -> None:
@@ -664,3 +746,129 @@ def test_last_seen_does_not_decrease_when_wall_clock_moves_backward() -> None:
     assert updated.first_seen == initial.first_seen
     assert updated.last_seen == initial.last_seen
     assert updated.first_seen <= updated.last_seen
+
+
+def test_active_session_protects_lineage_and_authorization_from_eviction() -> None:
+    identity = PublicIdentity(secret=b"shared-secret")
+    orchestration = OrchestrationRegistry(identity=identity)
+    sessions = SessionRegistry(
+        0,
+        identity=identity,
+        session_eviction_generation=orchestration.session_generation,
+        on_session_evicted=orchestration.remove_session_if_generation,
+    )
+    public_active = identity.public_id("active")
+    active_agent = identity.public_agent_id("active", "agent")
+    orchestration.observe_lineage(public_active, active_agent, None)
+    orchestration.authorize_raw_session("active", max_depth=2, duration_seconds=60)
+    active = sessions.begin(metadata("active", agent_id="agent"))
+    inactive = sessions.begin(metadata("inactive"))
+
+    sessions.finish(inactive, "completed")
+
+    assert active.public_id == public_active
+    assert orchestration.lineage(public_active, active_agent) is not None
+    assert orchestration.authorization(public_active).status == "active"
+
+
+async def test_orchestration_event_publishes_only_after_successful_mutation() -> None:
+    from claude_code_proxy.config import CodexOrchestrationMode
+    from claude_code_proxy.performance import Measurement
+    from claude_code_proxy.providers.codex.orchestration_policy import (
+        OrchestrationDecision,
+        OrchestrationDecisionCode,
+    )
+
+    clock = Clock()
+    sessions = registry(clock)
+    handle = sessions.begin(metadata("session", agent_id="agent"))
+    before = sessions.events.current_sequence
+
+    with pytest.raises(ValueError, match="orchestration mode"):
+        sessions.orchestration_decision(handle, object())
+    assert sessions.events.current_sequence == before
+
+    decision = OrchestrationDecision(
+        CodexOrchestrationMode.ENFORCE,
+        OrchestrationDecisionCode.NESTED_ALLOWED,
+        Measurement.observed(2),
+        True,
+        True,
+    )
+    sessions.orchestration_decision(handle, decision)
+    subscription = sessions.events.subscribe(before)
+    try:
+        [event] = subscription.replay
+    finally:
+        subscription.close()
+
+    assert event.type == "orchestration"
+    assert event.request.orchestration_decision == "nested_allowed"
+    assert event.request.orchestration_depth == Measurement.observed(2)
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["completed", "failed", "cancelled", "client_disconnected"],
+)
+def test_request_outcome_does_not_create_orchestration_lifecycle_state(outcome) -> None:
+    identity = PublicIdentity(secret=b"shared-secret")
+    orchestration = OrchestrationRegistry(identity=identity)
+    sessions = SessionRegistry(10, identity=identity)
+    public_session = identity.public_id("session")
+    public_agent = identity.public_agent_id("session", "agent")
+    lineage = orchestration.observe_lineage(public_session, public_agent, None)
+    orchestration.authorize_raw_session("session", max_depth=2, duration_seconds=60)
+    handle = sessions.begin(metadata("session", agent_id="agent"))
+
+    sessions.finish(handle, outcome)
+
+    assert orchestration.lineage(public_session, public_agent) == lineage
+    assert orchestration.authorization(public_session).status == "active"
+    assert not any(
+        term in name
+        for name in vars(orchestration)
+        for term in ("lifecycle", "worker", "revision")
+    )
+    snapshot = sessions.performance_snapshots().sessions[0].performance
+    assert snapshot.latest_request.outcome == outcome
+    assert snapshot.active_workers.status == "unavailable"
+    assert snapshot.revision_deduplication.status == "unavailable"
+
+
+def test_delayed_eviction_still_removes_lineage_after_concurrent_revoke() -> None:
+    identity = PublicIdentity(secret=b"shared-secret")
+    orchestration = OrchestrationRegistry(identity=identity)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def delayed_cleanup(public_id: str, generation: int) -> None:
+        callback_entered.set()
+        assert release_callback.wait(timeout=5)
+        orchestration.remove_session_if_generation(public_id, generation)
+
+    sessions = SessionRegistry(
+        0,
+        identity=identity,
+        session_eviction_generation=orchestration.session_generation,
+        on_session_evicted=delayed_cleanup,
+    )
+    public_session = identity.public_id("session")
+    public_agent = identity.public_agent_id("session", "agent")
+    orchestration.observe_lineage(public_session, public_agent, None)
+    orchestration.authorize_raw_session(
+        "session",
+        max_depth=2,
+        duration_seconds=60,
+    )
+    handle = sessions.begin(metadata("session", agent_id="agent"))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        finished = executor.submit(sessions.finish, handle, "completed")
+        assert callback_entered.wait(timeout=5)
+        assert orchestration.revoke_raw_session("session")
+        release_callback.set()
+        assert finished.result(timeout=5) is not None
+
+    assert orchestration.lineage(public_session, public_agent) is None
+    assert orchestration.session_generation(public_session) == 0

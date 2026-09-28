@@ -32,7 +32,7 @@ from .cli_common import (
     validated_filter as _validated_filter,
     validated_filters as _validated_filters,
 )
-from .config import PerformanceMode, Settings
+from .config import CodexOrchestrationMode, PerformanceMode, Settings
 from .control.client import (
     ControlClient,
     ControlError,
@@ -42,6 +42,7 @@ from .control.client import (
 from .control.schemas import AgentResponse, SessionListResponse, SessionResponse
 from .control.socket import resolve_socket_path
 from .limits import MAX_CONTROL_INTEGER
+from .orchestration_cli import orchestration as _orchestration_commands
 from .performance_cli import perf as _performance_report
 from .ps_watch_cli import validate_watch_output, watch_sessions
 
@@ -69,6 +70,7 @@ app = typer.Typer(
 )
 
 app.command(name="perf", help="Show or watch performance telemetry.")(_performance_report)
+app.add_typer(_orchestration_commands)
 
 
 def _interactive_tty() -> bool:
@@ -175,6 +177,13 @@ def proxy(
             help="Performance mode: off, collector, or logging.",
         ),
     ] = PerformanceMode.OFF,
+    codex_orchestration: Annotated[
+        CodexOrchestrationMode,
+        typer.Option(
+            "--codex-orchestration",
+            help="Codex orchestration mode: off, advisory, or enforce.",
+        ),
+    ] = CodexOrchestrationMode.ADVISORY,
 ) -> None:
     """Run the public proxy and local control endpoint in the foreground."""
     try:
@@ -186,6 +195,7 @@ def proxy(
             socket=socket,
             session_limit=session_limit,
             performance=performance,
+            codex_orchestration=codex_orchestration,
         )
         socket_path = resolve_socket_path(effective.control_socket_path)
         _configure_proxy_logging()
@@ -266,6 +276,7 @@ def _apply_proxy_overrides(
     socket: Path | None,
     session_limit: int | None,
     performance: PerformanceMode,
+    codex_orchestration: CodexOrchestrationMode,
 ) -> Settings:
     overrides = {
         "proxy_host": host,
@@ -273,6 +284,7 @@ def _apply_proxy_overrides(
         "control_socket_path": socket,
         "session_retention_limit": session_limit,
         "performance_mode": performance,
+        "codex_orchestration": codex_orchestration,
     }
     supplied = {
         name: value

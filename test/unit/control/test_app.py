@@ -6,7 +6,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
 import claude_code_proxy.control.app as control_app_module
-from claude_code_proxy.control.app import create_control_app
+from claude_code_proxy.control.app import create_control_app as _create_control_app
 from claude_code_proxy.control.schemas import (
     HealthResponse,
     SessionCounts,
@@ -18,6 +18,9 @@ from claude_code_proxy.observability import (
     SessionMetadata,
     SessionRegistry,
     SessionSnapshot,
+)
+from test.unit.control.app_test_support import (
+    create_test_control_app as create_control_app,
 )
 
 
@@ -147,6 +150,7 @@ async def test_health_counts_roots_not_agent_rows() -> None:
         "agents",
         "performance",
         "performance_events",
+        "orchestration_authorizations",
     ]
     assert response.json()["sessions"] == {"active": 1, "retained": 1}
 
@@ -178,7 +182,9 @@ async def test_health_reports_exact_version_process_time_limit_and_counts() -> N
             "agents",
             "performance",
             "performance_events",
+            "orchestration_authorizations",
         ],
+        "orchestration_mode": "advisory",
         "sessions": {"active": 1, "retained": 2},
         "inactive_limit": 7,
     }
@@ -614,3 +620,314 @@ async def test_control_app_normalizes_aware_datetimes_and_rejects_naive_ones() -
     )
     with pytest.raises(ValueError, match="clock result must be timezone-aware"):
         await request(naive_clock_app, "/v1/health")
+
+
+def test_orchestration_control_schemas_are_strict_frozen_and_bounded() -> None:
+    from claude_code_proxy.control.schemas import (
+        OrchestrationAuthorizationRequest,
+        OrchestrationAuthorizationResponse,
+        OrchestrationRevocationRequest,
+    )
+
+    request = OrchestrationAuthorizationRequest(
+        session_id="raw/session",
+        max_depth=2,
+        duration_seconds=1,
+    )
+    assert OrchestrationAuthorizationRequest(
+        session_id="x" * 256,
+        max_depth=2,
+        duration_seconds=1,
+    ).session_id == "x" * 256
+    with pytest.raises(ValidationError):
+        OrchestrationAuthorizationRequest(
+            session_id="x" * 257,
+            max_depth=2,
+            duration_seconds=1,
+        )
+    revocation = OrchestrationRevocationRequest(session_id="../raw-session")
+    assert OrchestrationRevocationRequest(session_id="x" * 256).session_id == "x" * 256
+    with pytest.raises(ValidationError):
+        OrchestrationRevocationRequest(session_id="x" * 257)
+    response = OrchestrationAuthorizationResponse(
+        session_id="a" * 64,
+        max_depth=8,
+        remaining_seconds=0.0,
+    )
+    with pytest.raises(ValidationError, match="frozen"):
+        request.max_depth = 3
+    with pytest.raises(ValidationError, match="frozen"):
+        response.max_depth = 3
+    with pytest.raises(ValidationError, match="frozen"):
+        revocation.session_id = "other"
+    for field, value in (
+        ("max_depth", True),
+        ("max_depth", 2.0),
+        ("max_depth", "2"),
+        ("duration_seconds", True),
+        ("duration_seconds", 1.0),
+        ("duration_seconds", "1"),
+    ):
+        payload = {
+            "session_id": "raw-session",
+            "max_depth": 2,
+            "duration_seconds": 1,
+            field: value,
+        }
+        with pytest.raises(ValidationError):
+            OrchestrationAuthorizationRequest.model_validate(payload)
+    with pytest.raises(ValidationError):
+        OrchestrationAuthorizationRequest.model_validate(
+            {
+                "session_id": "raw-session",
+                "max_depth": 2,
+                "duration_seconds": 1,
+                "extra": "rejected",
+            }
+        )
+    with pytest.raises(ValidationError):
+        OrchestrationRevocationRequest.model_validate(
+            {"session_id": "raw-session", "extra": "rejected"}
+        )
+    for remaining in (-1, float("nan"), float("inf")):
+        with pytest.raises(ValidationError):
+            OrchestrationAuthorizationResponse(
+                session_id="a" * 64,
+                max_depth=2,
+                remaining_seconds=remaining,
+            )
+
+
+async def test_private_orchestration_routes_hash_raw_session_and_list_active_rows() -> None:
+    from claude_code_proxy.config import CodexOrchestrationMode
+    from claude_code_proxy.public_identity import PublicIdentity
+    from claude_code_proxy.providers.codex.orchestration_registry import OrchestrationRegistry
+
+    identity = PublicIdentity(secret=b"private-control")
+    orchestration = OrchestrationRegistry(identity=identity, monotonic_clock=lambda: 100.0)
+    app = create_control_app(
+        registry(RegistryClock()),
+        application_version="1.0",
+        pid=1,
+        orchestration_registry=orchestration,
+        orchestration_mode=CodexOrchestrationMode.ENFORCE,
+    )
+    raw_ids = (
+        "sensitive-raw-session",
+        "folder/child",
+        ".",
+        "..",
+        "./nested",
+        "../sibling",
+    )
+    endpoint = "/v1/orchestration/authorizations"
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://control",
+    ) as client:
+        for raw in raw_ids:
+            allowed = await client.put(
+                endpoint,
+                json={
+                    "session_id": raw,
+                    "max_depth": 4,
+                    "duration_seconds": 60,
+                },
+            )
+            listed = await client.get(endpoint)
+            revoked = await client.request(
+                "DELETE", endpoint, json={"session_id": raw}
+            )
+            revoked_again = await client.request(
+                "DELETE", endpoint, json={"session_id": raw}
+            )
+
+            public_id = identity.public_id(raw)
+            assert allowed.status_code == 200
+            assert allowed.json() == {
+                "session_id": public_id,
+                "max_depth": 4,
+                "remaining_seconds": 60.0,
+            }
+            assert listed.json() == {"authorizations": [allowed.json()]}
+            assert json.dumps(raw) not in allowed.text + listed.text
+            assert revoked.status_code == revoked_again.status_code == 204
+            assert revoked.content == revoked_again.content == b""
+
+
+async def test_private_health_reports_orchestration_mode_and_capability() -> None:
+    from claude_code_proxy.config import CodexOrchestrationMode
+
+    app = create_control_app(
+        registry(RegistryClock()),
+        application_version="1.0",
+        pid=1,
+        orchestration_mode=CodexOrchestrationMode.ADVISORY,
+    )
+    response = await request(app, "/v1/health")
+
+    assert response.json()["orchestration_mode"] == "advisory"
+    assert "orchestration_authorizations" in response.json()["capabilities"]
+    assert response.json()["protocol_version"] == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"session_id": "raw-secret", "max_depth": True, "duration_seconds": 60},
+        {"session_id": "raw-secret", "max_depth": 2.0, "duration_seconds": 60},
+        {"session_id": "raw-secret", "max_depth": "2", "duration_seconds": 60},
+        {"session_id": "raw-secret", "max_depth": 2, "duration_seconds": True},
+        {"session_id": "raw-secret", "max_depth": 2, "duration_seconds": 60.0},
+        {"session_id": "raw-secret", "max_depth": 2, "duration_seconds": "60"},
+        {
+            "session_id": "raw-secret",
+            "max_depth": 2,
+            "duration_seconds": 60,
+            "raw": "secret-marker",
+        },
+    ],
+)
+async def test_private_authorization_validation_error_is_generic(payload) -> None:
+    app = create_control_app(registry(RegistryClock()), application_version="1.0", pid=1)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://control") as client:
+        response = await client.put(
+            "/v1/orchestration/authorizations",
+            json=payload,
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid control request"}
+    assert "raw-secret" not in response.text
+    assert "secret-marker" not in response.text
+
+
+def test_control_app_requires_shared_orchestration_dependencies() -> None:
+    with pytest.raises(TypeError, match="orchestration_registry"):
+        _create_control_app(
+            registry(RegistryClock()),
+            application_version="1.0",
+            pid=1,
+        )
+
+
+async def test_authorization_body_accepts_exact_byte_ceiling_and_rejects_one_over() -> None:
+    from claude_code_proxy.control.app import MAX_AUTHORIZATION_REQUEST_BYTES
+
+    app = create_control_app(
+        registry(RegistryClock()),
+        application_version="1.0",
+        pid=1,
+    )
+    payload = json.dumps({
+        "session_id": "bounded-session",
+        "max_depth": 2,
+        "duration_seconds": 60,
+    }).encode()
+    exact = payload + b" " * (MAX_AUTHORIZATION_REQUEST_BYTES - len(payload))
+    over = exact + b" "
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://control",
+    ) as client:
+        accepted = await client.put(
+            "/v1/orchestration/authorizations",
+            content=exact,
+            headers={"content-type": "application/json"},
+        )
+        rejected = await client.put(
+            "/v1/orchestration/authorizations",
+            content=over,
+            headers={"content-type": "application/json"},
+        )
+
+    assert len(exact) == MAX_AUTHORIZATION_REQUEST_BYTES
+    assert accepted.status_code == 200
+    assert rejected.status_code == 413
+    assert rejected.json() == {"detail": "Authorization request body too large"}
+
+
+async def test_authorization_body_ceiling_rejects_huge_and_chunked_bodies_privately() -> None:
+    from claude_code_proxy.control.app import MAX_AUTHORIZATION_REQUEST_BYTES
+
+    app = create_control_app(
+        registry(RegistryClock()),
+        application_version="1.0",
+        pid=1,
+    )
+    marker = "RAW_BODY_PRIVACY_MARKER"
+    huge = json.dumps({"session_id": marker + "x" * 1_000_000}).encode()
+
+    async def chunks():
+        yield b'{"session_id":"chunked-' + marker.encode()
+        yield b"x" * MAX_AUTHORIZATION_REQUEST_BYTES
+        yield b'"}'
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://control",
+    ) as client:
+        content_length = await client.put(
+            "/v1/orchestration/authorizations",
+            content=huge,
+            headers={"content-type": "application/json"},
+        )
+        chunked = await client.put(
+            "/v1/orchestration/authorizations",
+            content=chunks(),
+            headers={"content-type": "application/json"},
+        )
+
+    assert content_length.status_code == chunked.status_code == 413
+    exposed = content_length.text + chunked.text
+    assert marker not in exposed
+    assert content_length.json() == chunked.json() == {
+        "detail": "Authorization request body too large"
+    }
+
+
+async def test_authorization_capacity_error_is_fixed_and_does_not_echo_session() -> None:
+    from claude_code_proxy.config import CodexOrchestrationMode
+    from claude_code_proxy.public_identity import PublicIdentity
+    from claude_code_proxy.providers.codex.orchestration_registry import OrchestrationRegistry
+
+    orchestration = OrchestrationRegistry(
+        identity=PublicIdentity(secret=b"capacity-test"),
+        authorization_capacity=1,
+    )
+    app = create_control_app(
+        registry(RegistryClock()),
+        application_version="1.0",
+        pid=1,
+        orchestration_registry=orchestration,
+        orchestration_mode=CodexOrchestrationMode.ENFORCE,
+    )
+    endpoint = "/v1/orchestration/authorizations"
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://control",
+    ) as client:
+        first = await client.put(
+            endpoint,
+            json={
+                "session_id": "first-session",
+                "max_depth": 2,
+                "duration_seconds": 60,
+            },
+        )
+        second = await client.put(
+            endpoint,
+            json={
+                "session_id": "CAPACITY_RAW_SESSION_MARKER",
+                "max_depth": 2,
+                "duration_seconds": 60,
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json() == {
+        "detail": "Orchestration authorization capacity reached"
+    }
+    assert "CAPACITY_RAW_SESSION_MARKER" not in second.text

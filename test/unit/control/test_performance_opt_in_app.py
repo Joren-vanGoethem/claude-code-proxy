@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from httpx import ASGITransport, AsyncClient
 import pytest
 
-from claude_code_proxy.control.app import create_control_app
+from test.unit.control.app_test_support import create_test_control_app as create_control_app
 from claude_code_proxy.observability import SessionRegistry
 
 
@@ -27,7 +27,11 @@ async def test_disabled_control_app_advertises_only_inventory() -> None:
     health = await get(app, "/v1/health")
 
     assert health.status_code == 200
-    assert health.json()["capabilities"] == ["sessions", "agents"]
+    assert health.json()["capabilities"] == [
+        "sessions",
+        "agents",
+        "orchestration_authorizations",
+    ]
     assert (await get(app, "/v1/performance")).status_code == 404
     assert (await get(app, "/v1/performance/events")).status_code == 404
 
@@ -50,5 +54,6 @@ async def test_enabled_control_app_advertises_and_serves_performance() -> None:
         "agents",
         "performance",
         "performance_events",
+        "orchestration_authorizations",
     ]
     assert snapshot.status_code == 200

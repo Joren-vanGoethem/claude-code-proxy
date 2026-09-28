@@ -4,9 +4,6 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-import hashlib
-import hmac
-import secrets
 import threading
 import time
 import uuid
@@ -19,6 +16,7 @@ from .finalization import FinalizationResult, validate_finalization
 from .limits import MAX_CONTROL_INTEGER
 from .performance import OperationKind, ReasoningContinuation, RequestOutcome, RequestPerformance, RequestPerformanceSnapshot
 from .performance import RequestTelemetryObserver, SessionPerformance, SessionPerformanceSnapshot, validate_clock_sample
+from .public_identity import PublicIdentity
 from .performance_filters import (
     AmbiguousSessionId,
     FilterMap as SessionFilters,
@@ -206,6 +204,9 @@ class SessionRegistry:
         self,
         inactive_limit: int,
         secret: bytes | None = None,
+        identity: PublicIdentity | None = None,
+        on_session_evicted: Callable[..., None] | None = None,
+        session_eviction_generation: Callable[[str], int] | None = None,
         wall_clock: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
         events: EventJournal | None = None,
@@ -227,7 +228,11 @@ class SessionRegistry:
         self._inactive_limit = inactive_limit
         self._performance_enabled = performance_enabled
         self._performance_logging_enabled = logging_enabled
-        self._secret = secrets.token_bytes(32) if secret is None else secret
+        if secret is not None and identity is not None:
+            raise ValueError("secret and identity cannot both be supplied")
+        self._identity = identity or PublicIdentity(secret=secret)
+        self._on_session_evicted = on_session_evicted
+        self._session_eviction_generation = session_eviction_generation
         self._wall_clock = wall_clock or (lambda: datetime.now(UTC))
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._events = events or EventJournal(4096, 64)
@@ -260,17 +265,10 @@ class SessionRegistry:
 
     def public_id(self, identifier: str) -> str:
         """Return this process's stable opaque ID for an identifier."""
-        normalized = identifier.strip()
-        return hmac.new(
-            self._secret,
-            normalized.encode(errors="surrogatepass"),
-            hashlib.sha256,
-        ).hexdigest()
+        return self._identity.public_id(identifier)
 
     def public_agent_id(self, root_identifier: str, agent_id: str) -> str:
-        normalized_root = root_identifier.strip()
-        normalized_agent = agent_id.strip()
-        return self.public_id(f"agent:{normalized_root}\0{normalized_agent}")
+        return self._identity.public_agent_id(root_identifier, agent_id)
 
     def _agent_identity(
         self, root_identifier: str, identity: ClientIdentity,
@@ -588,6 +586,29 @@ class SessionRegistry:
                     occurred_at, now,
                 )
 
+    def orchestration_decision(
+        self, handle: ObservationHandle, decision: object
+    ) -> None:
+        with self._lock:
+            target = self._request_locked(handle)
+            if target is None:
+                return
+            record, request = target
+            occurred_at, now = self._sample_event_clocks_locked(request)
+            with self._events.reserve(1) as reservation:
+                if not request.record_orchestration_decision(decision):
+                    return
+                assert record.performance is not None
+                record.performance.record_orchestration_decision(request)
+                self._commit_events_locked(
+                    reservation,
+                    record,
+                    request,
+                    ("orchestration",),
+                    occurred_at,
+                    now,
+                )
+
     def finish(
         self,
         handle: ObservationHandle,
@@ -605,20 +626,25 @@ class SessionRegistry:
         validate_finalization(result, failure)
         with self._lock:
             if not self._performance_enabled:
-                return self._finish_without_performance_locked(handle, result)
-            return self._finish_with_performance_locked(
-                handle, result, failure
-            )
+                finalized, evicted = self._finish_without_performance_locked(
+                    handle, result
+                )
+            else:
+                finalized, evicted = self._finish_with_performance_locked(
+                    handle, result, failure
+                )
+        self._notify_evicted(evicted)
+        return finalized
 
     def _finish_with_performance_locked(
         self,
         handle: ObservationHandle,
         result: RequestOutcome,
         failure: FailureDiagnostic | None,
-    ) -> FinalizationResult:
+    ) -> tuple[FinalizationResult, tuple[str, ...]]:
         target = self._request_locked(handle)
         if target is None:
-            return FinalizationResult(False, None)
+            return FinalizationResult(False, None), ()
         record, request = target
         finished_at = self._wall_clock()
         finished_monotonic = self._monotonic_clock()
@@ -637,15 +663,15 @@ class SessionRegistry:
             )
             assert record.progress_at is not None
             record.progress_at.pop(handle.request_id, None)
-            self._retain_finished_locked(handle, record)
-            return FinalizationResult(True, terminal)
+            evicted = self._retain_finished_locked(handle, record)
+            return FinalizationResult(True, terminal), evicted
 
     def _finish_without_performance_locked(
         self, handle: ObservationHandle, result: RequestOutcome
-    ) -> FinalizationResult:
+    ) -> tuple[FinalizationResult, tuple[str, ...]]:
         record = self._active_record_locked(handle)
         if record is None:
-            return FinalizationResult(False, None)
+            return FinalizationResult(False, None), ()
         finished_at = self._wall_clock()
         finished_monotonic = validate_clock_sample(
             finished_at, self._monotonic_clock()
@@ -653,8 +679,8 @@ class SessionRegistry:
         self._finish_base_locked(
             record, handle, finished_at, finished_monotonic, result
         )
-        self._retain_finished_locked(handle, record)
-        return FinalizationResult(True, None)
+        evicted = self._retain_finished_locked(handle, record)
+        return FinalizationResult(True, None), evicted
 
     def _finish_base_locked(
         self,
@@ -689,12 +715,27 @@ class SessionRegistry:
 
     def _retain_finished_locked(
         self, handle: ObservationHandle, record: _SessionRecord
-    ) -> None:
+    ) -> tuple[tuple[str, int | None], ...]:
         if record.active:
-            return
+            return ()
         self._inactive[handle.key] = None
         self._inactive.move_to_end(handle.key)
-        self._evict_inactive()
+        return self._evict_inactive()
+
+    def _notify_evicted(
+        self, evicted: tuple[tuple[str, int | None], ...]
+    ) -> None:
+        callback = self._on_session_evicted
+        if callback is None:
+            return
+        for public_id, generation in evicted:
+            try:
+                if generation is None:
+                    callback(public_id)
+                else:
+                    callback(public_id, generation)
+            except Exception:
+                continue
 
     def snapshots(
         self,
@@ -857,10 +898,19 @@ class SessionRegistry:
             session=_performance(record).snapshot(now),
         )
 
-    def _evict_inactive(self) -> None:
+    def _evict_inactive(self) -> tuple[tuple[str, int | None], ...]:
+        evicted: list[tuple[str, int | None]] = []
         while len(self._inactive) > self._inactive_limit:
             oldest_key, _ = self._inactive.popitem(last=False)
+            public_id = self._records[oldest_key].public_id
+            generation = None
+            if self._session_eviction_generation is not None:
+                # Lock order is SessionRegistry then the auxiliary registry.
+                # Cleanup runs after this lock is released and never reverses it.
+                generation = self._session_eviction_generation(public_id)
             del self._records[oldest_key]
+            evicted.append((public_id, generation))
+        return tuple(evicted)
 
 
 def _validate_inactive_limit(inactive_limit: object) -> None:

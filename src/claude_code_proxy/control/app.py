@@ -9,12 +9,18 @@ from datetime import UTC, datetime
 from importlib import metadata
 from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from ..config import CodexOrchestrationMode
 from ..event_journal import OVERFLOW, JournalEvent
 from ..limits import MAX_CONTROL_INTEGER
 from ..performance_filters import FILTER_FIELDS
+from ..providers.codex.orchestration_registry import (
+    AuthorizationCapacityExceeded,
+    OrchestrationRegistry,
+)
 from ..observability import (
     AmbiguousSessionId,
     InvalidSessionFilter,
@@ -25,6 +31,10 @@ from ..observability import (
 )
 from .schemas import (
     HealthResponse,
+    OrchestrationAuthorizationListResponse,
+    OrchestrationAuthorizationRequest,
+    OrchestrationAuthorizationResponse,
+    OrchestrationRevocationRequest,
     PerformanceCursorResponse,
     PerformanceEventResponse,
     PerformanceListResponse,
@@ -37,6 +47,7 @@ from .schemas import (
 from .streaming import OwnedPerformanceStreamingResponse, SubscriptionOwner
 
 _DISTRIBUTION_NAME = "anthropic-proxy"
+MAX_AUTHORIZATION_REQUEST_BYTES = 1024
 _MAX_FILTER_ENTRIES = 32
 _MAX_FILTER_ENTRY_LENGTH = 256
 _FilterQuery = Annotated[list[str] | None, Query()]
@@ -46,6 +57,8 @@ _ResumeQuery = Annotated[list[str] | None, Query()]
 @dataclass(frozen=True)
 class _ControlContext:
     sessions: SessionRegistry
+    orchestration_registry: OrchestrationRegistry
+    orchestration_mode: CodexOrchestrationMode
     started_at: datetime
     application_version: str
     pid: int
@@ -55,6 +68,9 @@ class _ControlContext:
 
 def create_control_app(
     sessions: SessionRegistry,
+    *,
+    orchestration_registry: OrchestrationRegistry,
+    orchestration_mode: CodexOrchestrationMode,
     started_at: datetime | None = None,
     application_version: str | None = None,
     pid: int | None = None,
@@ -62,8 +78,12 @@ def create_control_app(
     heartbeat_interval: float = 15.0,
 ) -> FastAPI:
     """Create the isolated local control API with explicit dependencies."""
+    if not isinstance(orchestration_mode, CodexOrchestrationMode):
+        raise TypeError("orchestration_mode must be a CodexOrchestrationMode")
     context = _ControlContext(
         sessions=sessions,
+        orchestration_registry=orchestration_registry,
+        orchestration_mode=orchestration_mode,
         started_at=_aware_utc(
             _utc_now() if started_at is None else started_at,
             "started_at",
@@ -82,8 +102,53 @@ def create_control_app(
         redoc_url=None,
         openapi_url=None,
     )
+
+    @application.middleware("http")
+    async def bound_authorization_body(request: Request, call_next):
+        if not _is_authorization_mutation(request):
+            return await call_next(request)
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            if not content_length.isascii() or not content_length.isdecimal():
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": "Invalid control request"},
+                )
+            if len(content_length) > 10:
+                return _authorization_body_too_large()
+            if int(content_length) > MAX_AUTHORIZATION_REQUEST_BYTES:
+                return _authorization_body_too_large()
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > MAX_AUTHORIZATION_REQUEST_BYTES:
+                return _authorization_body_too_large()
+            body.extend(chunk)
+        request._body = bytes(body)
+        return await call_next(request)
+
+    @application.exception_handler(RequestValidationError)
+    async def invalid_control_request(_request, _error) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "Invalid control request"},
+        )
+
     _register_control_routes(application, context)
     return application
+
+
+def _is_authorization_mutation(request: Request) -> bool:
+    return (
+        request.url.path == "/v1/orchestration/authorizations"
+        and request.method in {"PUT", "DELETE"}
+    )
+
+
+def _authorization_body_too_large() -> JSONResponse:
+    return JSONResponse(
+        status_code=413,
+        content={"detail": "Authorization request body too large"},
+    )
 
 
 def _register_control_routes(
@@ -97,6 +162,47 @@ def _register_control_routes(
     @application.get("/v1/sessions", response_model=SessionListResponse)
     def list_sessions(filter: _FilterQuery = None) -> SessionListResponse:
         return _session_list_response(context, filter)
+
+    @application.put(
+        "/v1/orchestration/authorizations",
+        response_model=OrchestrationAuthorizationResponse,
+    )
+    def allow_nesting(
+        request: OrchestrationAuthorizationRequest,
+    ) -> OrchestrationAuthorizationResponse:
+        try:
+            authorization = context.orchestration_registry.authorize_raw_session(
+                request.session_id,
+                max_depth=request.max_depth,
+                duration_seconds=request.duration_seconds,
+            )
+        except AuthorizationCapacityExceeded:
+            raise HTTPException(
+                409,
+                "Orchestration authorization capacity reached",
+            ) from None
+        except (TypeError, ValueError):
+            raise HTTPException(422, "Invalid orchestration authorization") from None
+        return OrchestrationAuthorizationResponse(
+            session_id=authorization.session_id,
+            max_depth=request.max_depth,
+            remaining_seconds=float(request.duration_seconds),
+        )
+
+    @application.delete("/v1/orchestration/authorizations")
+    def revoke_nesting(request: OrchestrationRevocationRequest) -> Response:
+        try:
+            context.orchestration_registry.revoke_raw_session(request.session_id)
+        except (TypeError, ValueError):
+            raise HTTPException(422, "Invalid orchestration authorization") from None
+        return Response(status_code=204)
+
+    @application.get(
+        "/v1/orchestration/authorizations",
+        response_model=OrchestrationAuthorizationListResponse,
+    )
+    def list_authorizations() -> OrchestrationAuthorizationListResponse:
+        return _authorization_list_response(context)
 
     if context.sessions.performance_enabled:
         _register_performance_routes(application, context)
@@ -135,12 +241,31 @@ def _health_response(context: _ControlContext) -> HealthResponse:
         started_at=context.started_at,
         uptime_seconds=max(0.0, (now - context.started_at).total_seconds()),
         capabilities=(
-            ("sessions", "agents", "performance", "performance_events")
+            (
+                "sessions",
+                "agents",
+                "performance",
+                "performance_events",
+                "orchestration_authorizations",
+            )
             if context.sessions.performance_enabled
-            else ("sessions", "agents")
+            else ("sessions", "agents", "orchestration_authorizations")
         ),
+        orchestration_mode=context.orchestration_mode.value,
         sessions=SessionCounts(active=active, retained=retained),
         inactive_limit=context.sessions.inactive_limit,
+    )
+
+
+def _authorization_list_response(
+    context: _ControlContext,
+) -> OrchestrationAuthorizationListResponse:
+    rows = context.orchestration_registry.authorizations()
+    return OrchestrationAuthorizationListResponse(
+        authorizations=tuple(
+            OrchestrationAuthorizationResponse.model_validate(row, from_attributes=True)
+            for row in rows
+        )
     )
 
 
