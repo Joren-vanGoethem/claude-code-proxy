@@ -31,6 +31,9 @@ class CodexOrchestrationMode(StrEnum):
     ENFORCE = "enforce"
 
 
+ModelBackend = Literal["openai", "vllm"]
+
+
 class ModelDefinition(BaseModel):
     """Configured upstream model and its known capability limits."""
 
@@ -41,6 +44,7 @@ class ModelDefinition(BaseModel):
     max_output_tokens: int | None = Field(
         default=None, strict=True, gt=0, le=MAX_CONTROL_INTEGER
     )
+    backend: ModelBackend = "openai"
 
     @model_validator(mode="after")
     def validate_target(self) -> "ModelDefinition":

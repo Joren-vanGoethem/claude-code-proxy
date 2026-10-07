@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from claude_code_proxy import config as config_module
 from claude_code_proxy.config import (
@@ -382,3 +383,16 @@ def test_rejects_legacy_raw_targets(tmp_path):
 
     with pytest.raises(ValueError, match="unknown model"):
         load_model_mapping(path)
+
+
+def test_model_definition_defaults_to_the_openai_backend():
+    definition = ModelDefinition(target="openai/gpt-5.6-sol", context_window=1000)
+
+    assert definition.backend == "openai"
+
+
+def test_model_definition_rejects_an_unknown_backend():
+    with pytest.raises(ValidationError):
+        ModelDefinition(
+            target="openai/gpt-5.6-sol", context_window=1000, backend="tgi"
+        )

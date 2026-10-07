@@ -329,9 +329,14 @@ Every model definition requires:
 - `target`: exact upstream provider model.
 - `context_window`: positive token count up to `9223372036854775807`, or `null` when capability is unknown.
 
-Every model definition accepts one optional key:
+Every model definition accepts two optional keys:
 
 - `max_output_tokens`: the largest `max_tokens` the proxy forwards to this target. The proxy sends the smaller of the client's `max_tokens` and this value. Omit it, and `openai/...` and `gemini/...` targets fall back to 16384 while `anthropic/...` targets forward the client's value unchanged. Keep it below `context_window` minus the largest prompt you expect, because an upstream rejects a request whose prompt and output ceiling together exceed its context length.
+- `backend`: the compatibility profile of the server behind this target, either `openai` (the default) or `vllm`. It changes nothing about routing or authentication; it only tells the proxy which payload quirks the server has.
+
+Set `backend: "vllm"` for a self-hosted server that renders a strict chat template, such as vLLM or llama.cpp. Those templates reject a payload whose `system` message is not the first one, and clients such as Claude Code inject a `system` message part-way through the conversation. With this profile the proxy carries each non-leading `system` message through as a `user` message, keeping its position in the transcript.
+
+Leave `backend` at `openai` for the OpenAI API and for any server that accepts a `system` message anywhere. The proxy then sends the messages exactly as the client wrote them, so a mid-conversation `system` message keeps its system authority.
 
 Tier values reference model-definition names. Each mapping selects exactly one model definition:
 

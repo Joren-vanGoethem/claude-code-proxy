@@ -1162,9 +1162,10 @@ async def test_count_tokens_preserves_import_fallback(settings):
     assert await LiteLLMProvider(settings, object()).count_tokens(request()) == 1000
 
 
-def test_mid_conversation_system_message_becomes_user_for_openai(settings):
+def test_mid_conversation_system_message_becomes_user_for_vllm(settings):
     payload = LiteLLMProvider(settings, object()).build_request(
         request(
+            backend="vllm",
             system=(TextBlock("be helpful"),),
             messages=(
                 Message("user", (TextBlock("hello"),)),
@@ -1206,3 +1207,22 @@ def test_anthropic_target_without_configured_cap_forwards_max_tokens(settings):
     )
 
     assert payload["max_completion_tokens"] == 128_000
+
+
+def test_mid_conversation_system_message_survives_on_the_openai_backend(settings):
+    payload = LiteLLMProvider(settings, object()).build_request(
+        request(
+            system=(TextBlock("be helpful"),),
+            messages=(
+                Message("user", (TextBlock("hello"),)),
+                Message("system", (TextBlock("hook context"),)),
+            ),
+        ),
+        stream=False,
+    )
+
+    assert [message["role"] for message in payload["messages"]] == [
+        "system",
+        "user",
+        "system",
+    ]

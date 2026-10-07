@@ -883,3 +883,69 @@ async def test_final_delta_preserves_explicit_zero_thinking_tokens():
     )
 
     assert delta["usage"]["output_tokens_details"] == {"thinking_tokens": 0}
+
+
+@pytest.mark.asyncio
+async def test_separator_text_between_parallel_tool_calls_is_dropped():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    errors = []
+    events = event_source(
+        ToolUseStart("0", "tool-1", "Bash"),
+        ToolInputDelta("0", '{"command": "ls"}'),
+        TextDelta("\n"),
+        ToolUseStart("1", "tool-2", "Read"),
+        ToolInputDelta("1", '{"path": "README.md"}'),
+        ToolUseEnd("0"),
+        ToolUseEnd("1"),
+        StreamComplete("tool_use", TokenUsage(1, 1)),
+    )
+
+    frames = [
+        frame
+        async for frame in serialize_stream(
+            normalized, events, on_error=errors.append
+        )
+    ]
+
+    assert errors == []
+    assert event_names(frames).count("content_block_start") == 2
+    assert "text_delta" not in "".join(frames)
+
+
+@pytest.mark.asyncio
+async def test_text_between_tool_calls_is_emitted_after_the_tool_blocks():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    errors = []
+    events = event_source(
+        ToolUseStart("0", "tool-1", "Bash"),
+        ToolInputDelta("0", '{"command": "ls"}'),
+        TextDelta("now reading the file"),
+        ToolUseEnd("0"),
+        StreamComplete("tool_use", TokenUsage(1, 1)),
+    )
+
+    frames = [
+        frame
+        async for frame in serialize_stream(
+            normalized, events, on_error=errors.append
+        )
+    ]
+
+    assert errors == []
+    assert event_names(frames) == [
+        "message_start",
+        "ping",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert "now reading the file" in "".join(frames)

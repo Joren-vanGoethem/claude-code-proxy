@@ -189,7 +189,8 @@ class LiteLLMProvider:
         self._apply_auth(payload, request.model)
         if request.model.startswith("openai/"):
             self._normalize_openai_messages(payload["messages"])
-            self._demote_trailing_system_messages(payload["messages"])
+            if request.backend == "vllm":
+                self._demote_trailing_system_messages(payload["messages"])
         return payload
 
     def _convert_message(self, role, content):
@@ -255,10 +256,15 @@ class LiteLLMProvider:
     def _demote_trailing_system_messages(messages):
         """Keep only a leading system message.
 
-        Chat templates served by OpenAI-compatible backends such as vLLM reject
-        a system message that is not the first one. Clients inject system turns
+        A strict chat template, such as the ones vLLM renders, rejects a system
+        message that is not the first one. Clients inject system turns
         mid-conversation, so carry those through as user turns to hold their
         position in the transcript.
+
+        This runs only for a target whose model definition sets
+        `backend: "vllm"`. The OpenAI API itself accepts a system message
+        anywhere, and demoting one there would weaken an instruction the client
+        meant to carry system authority.
         """
         for message in messages[1:]:
             if message.get("role") == "system":

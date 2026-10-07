@@ -221,6 +221,7 @@ class _AnthropicStreamState:
         self.tool_started = False
         self.tool_indices: dict[str, int] = {}
         self.open_tools: set[str] = set()
+        self.pending_text: list[str] = []
         self.next_index = 0
 
     def start(self) -> list[str]:
@@ -264,8 +265,14 @@ class _AnthropicStreamState:
         raise TypeError(f"Unsupported stream event: {type(event).__name__}")
 
     def _text_delta(self, event: TextDelta) -> list[str]:
-        if self.tool_started:
-            raise ValueError("text delta received after tool content")
+        if self.open_tools:
+            # A tool block is still streaming its arguments, and Anthropic
+            # content blocks may not overlap. Hold the text until the tool
+            # blocks close, then emit it as a trailing block. Some providers
+            # separate parallel tool calls with a newline, which strips away
+            # to nothing and never reaches the client.
+            self.pending_text.append(event.text)
+            return []
         frames = []
         if not self.text_open:
             self.text_index = self._allocate_index()
@@ -350,6 +357,7 @@ class _AnthropicStreamState:
         if self.open_tools:
             raise ValueError("stream completed with open tool blocks")
         frames = self._close_text()
+        frames.extend(self._flush_pending_text())
         if self.next_index == 0:
             index = self._allocate_index()
             frames.extend(
@@ -389,6 +397,30 @@ class _AnthropicStreamState:
                     },
                 },
             )
+        ]
+
+    def _flush_pending_text(self) -> list[str]:
+        """Emit text held back while a tool block was streaming.
+
+        Text that strips to nothing is a provider separator, not model output,
+        so it is dropped rather than sent as an empty block.
+        """
+        text = "".join(self.pending_text)
+        self.pending_text.clear()
+        if not text.strip():
+            return []
+        index = self._allocate_index()
+        return [
+            self._block_start(index, {"type": "text", "text": ""}),
+            _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            ),
+            self._block_stop(index),
         ]
 
     def _close_text(self) -> list[str]:
