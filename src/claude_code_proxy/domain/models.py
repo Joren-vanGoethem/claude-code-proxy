@@ -91,6 +91,8 @@ class CompletionRequest:
     messages: tuple[Message, ...]
     reasoning: ReasoningPolicy
     context_window: int | None = None
+    max_output_tokens: int | None = None
+    backend: str = "openai"
     client_identity: ClientIdentity = field(default_factory=ClientIdentity)
     system: tuple[TextBlock, ...] = ()
     tools: tuple[ToolDefinition, ...] = ()
