@@ -38,6 +38,7 @@ from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.providers.litellm import LiteLLMProvider, clean_gemini_schema
 from claude_code_proxy.reasoning import (
     OutputConfig,
+    ReasoningPolicy,
     ThinkingConfig,
 )
 
@@ -1265,3 +1266,89 @@ def test_mid_conversation_system_message_survives_on_the_openai_backend(settings
         "user",
         "system",
     ]
+
+
+_REASONING_CHUNKS = [
+    {"choices": [{"delta": {"reasoning_content": "think"}, "finish_reason": None}]},
+    {"choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}]},
+]
+
+
+async def _stream_events(settings, **changes):
+    client = FakeClient(chunks=_REASONING_CHUNKS)
+    return [
+        event
+        async for event in LiteLLMProvider(settings, client).stream(
+            request(**changes)
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_streams_reasoning_content_as_thinking(settings):
+    from claude_code_proxy.domain.models import ThinkingDelta
+
+    events = await _stream_events(settings, backend="vllm")
+
+    assert events[:3] == [StreamStart(), ThinkingDelta("think"), TextDelta("answer")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [
+    "openai/gpt-5.6-sol", "gemini/gemini-3-pro", "anthropic/claude-sonnet-5",
+])
+async def test_default_backend_keeps_dropping_reasoning_content(settings, model):
+    events = await _stream_events(settings, model=model)
+
+    assert events == [
+        StreamStart(), TextDelta("answer"), StreamComplete("end_turn", TokenUsage(0, 0)),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", [
+    ReasoningPolicy(False, None), ReasoningPolicy(None, None),
+])
+async def test_vllm_backend_hides_reasoning_unless_requested(settings, policy):
+    events = await _stream_events(settings, backend="vllm", reasoning=policy)
+
+    assert [type(event).__name__ for event in events] == [
+        "StreamStart", "TextDelta", "StreamComplete",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_ignores_non_string_reasoning(settings):
+    client = FakeClient(chunks=[
+        {"choices": [{"delta": {"reasoning_content": None, "content": "a"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"reasoning_content": 7}, "finish_reason": "stop"}]},
+    ])
+
+    events = [
+        event
+        async for event in LiteLLMProvider(settings, client).stream(
+            request(backend="vllm")
+        )
+    ]
+
+    assert events[1:2] == [TextDelta("a")]
+    assert len(events) == 3
+
+
+@pytest.mark.asyncio
+async def test_complete_returns_thinking_block_for_vllm_only(settings):
+    from claude_code_proxy.domain.models import ThinkingBlock
+
+    response = {
+        "id": "r1",
+        "choices": [{"message": {"content": "answer", "reasoning_content": "why"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+
+    vllm = await LiteLLMProvider(settings, FakeClient(response)).complete(
+        request(backend="vllm")
+    )
+    plain = await LiteLLMProvider(settings, FakeClient(response)).complete(request())
+
+    assert vllm.content == (ThinkingBlock("why"), TextBlock("answer"))
+    assert plain.content == (TextBlock("answer"),)
