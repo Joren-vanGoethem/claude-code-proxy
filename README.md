@@ -336,6 +336,8 @@ Every model definition accepts two optional keys:
 
 Set `backend: "vllm"` for a self-hosted server that renders a strict chat template, such as vLLM or llama.cpp. Those templates reject a payload whose `system` message is not the first one, and clients such as Claude Code inject a `system` message part-way through the conversation. With this profile the proxy carries each non-leading `system` message through as a `user` message, keeping its position in the transcript.
 
+The `vllm` profile also sends the conversation back using the OpenAI tool-call protocol: a past tool call travels in the assistant message's `tool_calls`, and its result travels as a `tool` message. The default profile flattens both into prose, which reads to a model as text it wrote itself, so it writes its next tool call as prose too and no parser recognises it as a call.
+
 Leave `backend` at `openai` for the OpenAI API and for any server that accepts a `system` message anywhere. The proxy then sends the messages exactly as the client wrote them, so a mid-conversation `system` message keeps its system authority.
 
 Tier values reference model-definition names. Each mapping selects exactly one model definition:

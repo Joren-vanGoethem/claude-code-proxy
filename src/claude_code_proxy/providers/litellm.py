@@ -161,8 +161,15 @@ class LiteLLMProvider:
         messages = []
         if request.system:
             messages.append({"role": "system", "content": "\n\n".join(block.text for block in request.system)})
+        tool_protocol = (
+            request.model.startswith("openai/") and request.backend == "vllm"
+        )
         for message in request.messages:
-            messages.extend(self._convert_message(message.role, message.content))
+            messages.extend(
+                self._convert_message(
+                    message.role, message.content, tool_protocol=tool_protocol
+                )
+            )
 
         max_tokens = self._output_token_cap(request)
         payload: dict[str, Any] = {
@@ -193,7 +200,9 @@ class LiteLLMProvider:
                 self._demote_trailing_system_messages(payload["messages"])
         return payload
 
-    def _convert_message(self, role, content):
+    def _convert_message(self, role, content, *, tool_protocol=False):
+        if tool_protocol:
+            return self._convert_message_as_tool_protocol(role, content)
         if len(content) == 1 and isinstance(content[0], TextBlock):
             return [{"role": role, "content": content[0].text}]
         if role == "user" and any(isinstance(block, ToolResultBlock) for block in content):
@@ -215,6 +224,51 @@ class LiteLLMProvider:
             elif isinstance(block, ToolResultBlock):
                 blocks.append({"type": "tool_result", "tool_use_id": block.tool_use_id, "content": [{"type": "text", "text": parse_tool_result_content(block.content)}]})
         return [{"role": role, "content": blocks}]
+
+    @staticmethod
+    def _convert_message_as_tool_protocol(role, content):
+        """Convert one message using the OpenAI tool-call protocol.
+
+        A `tool_use` block becomes an entry in the message's `tool_calls`, and
+        a `tool_result` block becomes a `tool` message of its own, keyed by the
+        call it answers. The flattened text the default path produces reads to
+        a model as prose it wrote itself, so it writes its next tool call the
+        same way and no parser recognises it as a call.
+
+        A `tool` message must follow the assistant turn that made the call, so
+        the tool messages come first and any text in the same Anthropic message
+        follows them.
+        """
+        tool_messages = []
+        text = []
+        tool_calls = []
+        for block in content:
+            if isinstance(block, TextBlock):
+                text.append(block.text)
+            elif isinstance(block, ImageBlock):
+                text.append("[Image content - not displayed in text format]")
+            elif isinstance(block, ToolUseBlock):
+                tool_calls.append({
+                    "id": block.id,
+                    "type": "function",
+                    "function": {
+                        "name": block.name,
+                        "arguments": json.dumps(block.input),
+                    },
+                })
+            elif isinstance(block, ToolResultBlock):
+                tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": block.tool_use_id,
+                    "content": parse_tool_result_content(block.content),
+                })
+        body = "\n".join(part for part in text if part).strip()
+        if not body and not tool_calls:
+            return tool_messages
+        message = {"role": role, "content": body}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return [*tool_messages, message]
 
     def _add_tools(self, payload, request):
         tools = []
