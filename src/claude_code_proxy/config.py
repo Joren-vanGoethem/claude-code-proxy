@@ -32,12 +32,15 @@ class CodexOrchestrationMode(StrEnum):
 
 
 class ModelDefinition(BaseModel):
-    """Configured upstream model and its known context capability."""
+    """Configured upstream model and its known capability limits."""
 
     model_config = ConfigDict(frozen=True)
 
     target: str
     context_window: int | None = Field(strict=True, gt=0, le=MAX_CONTROL_INTEGER)
+    max_output_tokens: int | None = Field(
+        default=None, strict=True, gt=0, le=MAX_CONTROL_INTEGER
+    )
 
     @model_validator(mode="after")
     def validate_target(self) -> "ModelDefinition":

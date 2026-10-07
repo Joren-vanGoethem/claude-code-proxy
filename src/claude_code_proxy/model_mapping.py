@@ -20,6 +20,7 @@ class ResolvedModel:
     mapped: bool
     effort: MappingEffort | None
     context_window: int | None
+    max_output_tokens: int | None = None
 
 
 class ModelResolver:
@@ -76,6 +77,7 @@ class ModelResolver:
             mapped=True,
             effort=entry.effort,
             context_window=definition.context_window,
+            max_output_tokens=definition.max_output_tokens,
         )
 
     def _model_name(self, entry: MappingEntry) -> str:

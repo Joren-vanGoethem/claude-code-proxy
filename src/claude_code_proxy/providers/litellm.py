@@ -42,6 +42,10 @@ from .usage import normalize_usage
 
 logger = logging.getLogger(__name__)
 
+# Output ceiling for OpenAI and Gemini targets whose model definition declares
+# no max_output_tokens.
+DEFAULT_MAX_OUTPUT_TOKENS = 16_384
+
 
 def clean_gemini_schema(schema: Any) -> Any:
     if isinstance(schema, dict):
@@ -139,6 +143,20 @@ class LiteLLMProvider:
         self._settings = settings
         self._client = client
 
+    @staticmethod
+    def _output_token_cap(request: CompletionRequest) -> int:
+        """Return the output-token ceiling for this request.
+
+        A model definition that declares `max_output_tokens` sets the ceiling.
+        Without one, OpenAI and Gemini targets fall back to the conservative
+        default that suits hosted models of unknown capability.
+        """
+        if request.max_output_tokens is not None:
+            return min(request.max_tokens, request.max_output_tokens)
+        if request.model.startswith(("openai/", "gemini/")):
+            return min(request.max_tokens, DEFAULT_MAX_OUTPUT_TOKENS)
+        return request.max_tokens
+
     def build_request(self, request: CompletionRequest, *, stream: bool) -> dict[str, Any]:
         messages = []
         if request.system:
@@ -146,9 +164,7 @@ class LiteLLMProvider:
         for message in request.messages:
             messages.extend(self._convert_message(message.role, message.content))
 
-        max_tokens = request.max_tokens
-        if request.model.startswith(("openai/", "gemini/")):
-            max_tokens = min(max_tokens, 16_384)
+        max_tokens = self._output_token_cap(request)
         payload: dict[str, Any] = {
             "model": request.model,
             "messages": messages,
@@ -173,6 +189,7 @@ class LiteLLMProvider:
         self._apply_auth(payload, request.model)
         if request.model.startswith("openai/"):
             self._normalize_openai_messages(payload["messages"])
+            self._demote_trailing_system_messages(payload["messages"])
         return payload
 
     def _convert_message(self, role, content):
@@ -233,6 +250,19 @@ class LiteLLMProvider:
                 payload["api_key"] = self._settings.gemini_api_key
         else:
             payload["api_key"] = self._settings.anthropic_api_key
+
+    @staticmethod
+    def _demote_trailing_system_messages(messages):
+        """Keep only a leading system message.
+
+        Chat templates served by OpenAI-compatible backends such as vLLM reject
+        a system message that is not the first one. Clients inject system turns
+        mid-conversation, so carry those through as user turns to hold their
+        position in the transcript.
+        """
+        for message in messages[1:]:
+            if message.get("role") == "system":
+                message["role"] = "user"
 
     @staticmethod
     def _normalize_openai_messages(messages):
