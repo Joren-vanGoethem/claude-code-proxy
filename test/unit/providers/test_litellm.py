@@ -122,6 +122,45 @@ def test_tool_result_is_flattened_for_openai(settings):
     assert payload["messages"][1]["content"] == "Tool result for call-1:\ndone"
 
 
+def test_vllm_backend_keeps_the_openai_tool_call_protocol(settings):
+    payload = LiteLLMProvider(settings, object()).build_request(request(
+        backend="vllm",
+        messages=(
+            Message("assistant", (TextBlock("checking"), ToolUseBlock("call-1", "lookup", {"q": "x"}))),
+            Message("user", (ToolResultBlock("call-1", [{"type": "text", "text": "done"}]),)),
+        ),
+    ), stream=False)
+    assistant, result = payload["messages"][0], payload["messages"][1]
+    assert assistant["content"] == "checking"
+    assert assistant["tool_calls"] == [{
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"q": "x"}'},
+    }]
+    assert result == {"role": "tool", "tool_call_id": "call-1", "content": "done"}
+
+
+def test_vllm_tool_result_precedes_text_in_the_same_message(settings):
+    payload = LiteLLMProvider(settings, object()).build_request(request(
+        backend="vllm",
+        messages=(
+            Message("assistant", (ToolUseBlock("call-1", "lookup", {}),)),
+            Message("user", (ToolResultBlock("call-1", [{"type": "text", "text": "done"}]), TextBlock("and now this"))),
+        ),
+    ), stream=False)
+    assert [message["role"] for message in payload["messages"]] == ["assistant", "tool", "user"]
+    assert payload["messages"][2]["content"] == "and now this"
+
+
+def test_tool_calls_stay_flattened_on_the_openai_backend(settings):
+    payload = LiteLLMProvider(settings, object()).build_request(request(messages=(
+        Message("assistant", (ToolUseBlock("call-1", "lookup", {"q": "x"}),)),
+        Message("user", (ToolResultBlock("call-1", [{"type": "text", "text": "done"}]),)),
+    )), stream=False)
+    assert "tool_calls" not in payload["messages"][0]
+    assert payload["messages"][0]["content"].startswith("[Tool: lookup")
+
+
 def test_gemini_schema_cleaning_and_vertex_auth(settings):
     vertex = replace(settings, use_vertex_auth=True)
     payload = LiteLLMProvider(vertex, object()).build_request(request(
