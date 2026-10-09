@@ -92,6 +92,47 @@ Point your existing [Claude Code installation](https://code.claude.com/docs/en/s
 ANTHROPIC_BASE_URL=http://localhost:8082 claude
 ```
 
+### Run several proxies
+
+Keep one checkout and run one proxy per backend, for example a self-hosted vLLM server next to a hosted service. Each proxy is a *profile*: a directory `profiles/<name>/` holding its own `.env` and `model_mapping.json`. Every profile runs as its own Compose project on its own `PROXY_PORT`, and you pick one when you launch Claude Code.
+
+1. Copy the example and fill in the credentials. The example targets a [Z.ai](https://z.ai) Coding Plan.
+
+   ```bash
+   cp -r profiles/example profiles/z
+   mv profiles/z/.env.example profiles/z/.env
+   $EDITOR profiles/z/.env
+   ```
+
+2. Give every profile a different `PROXY_PORT` in its `.env`. `claude-proxy ls` shows the ports in use.
+3. Start and list the proxies:
+
+   ```bash
+   scripts/claude-proxy up z
+   scripts/claude-proxy ls
+   ```
+
+4. Launch Claude Code through a profile. `run` starts the profile if it is stopped, reads `PROXY_PORT` from its `.env`, and passes every other argument to `claude`:
+
+   ```bash
+   scripts/claude-proxy run z --dangerously-skip-permissions
+   ```
+
+   One alias per proxy keeps the choice to a single word:
+
+   ```bash
+   alias claudez='/path/to/claude-code-proxy/scripts/claude-proxy run z --dangerously-skip-permissions'
+   alias claudespark='/path/to/claude-code-proxy/scripts/claude-proxy run spark --dangerously-skip-permissions'
+   ```
+
+`claude-proxy down <name>` removes a profile's container and `claude-proxy logs <name>` follows its logs. Profile directories other than `profiles/example` are git-ignored, so credentials stay out of commits. Without the script, set `PROFILE_DIR` yourself: `PROFILE_DIR=profiles/z docker compose --env-file profiles/z/.env -p claude-proxy-z up -d --build`.
+
+Three faults commonly stop a hosted profile from working:
+
+- **Wrong endpoint.** A Z.ai Coding Plan key works only on `https://api.z.ai/api/coding/paas/v4`. On `https://api.z.ai/api/v1` or `/api/paas/v4` the proxy returns `API Error: 403 {"detail":"Permission denied"}`, and the log shows `code=upstream_http_error status=403`.
+- **Stale settings.** Compose reads `env_file` only when it creates the container. After you edit a profile's `.env`, run `scripts/claude-proxy down <name>` and `up <name>`, or `docker compose ... up -d --force-recreate`.
+- **Retired model IDs.** List the IDs your key can call with `curl -H "Authorization: Bearer $OPENAI_API_KEY" https://api.z.ai/api/coding/paas/v4/models`, and use them in the profile's `model_mapping.json`.
+
 ## CLI and Session Inspection
 
 Run the CLI without a subcommand to show help:

@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Manage several proxy instances ("profiles") from one checkout.
+#
+# A profile is a directory profiles/<name>/ holding .env and model_mapping.json.
+# Each profile runs as its own Compose project on its own PROXY_PORT.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROFILES_DIR="${CLAUDE_PROXY_PROFILES_DIR:-$ROOT/profiles}"
+
+usage() {
+  cat <<USAGE
+Usage: claude-proxy <command> [args]
+
+  up <name>                 build and start the profile
+  down <name>               stop and remove the profile
+  logs <name>               follow the profile's container logs
+  ls                        list profiles, their ports and state
+  run <name> [claude args]  start the profile if needed, then run claude against it
+USAGE
+}
+
+die() {
+  echo "claude-proxy: $*" >&2
+  exit 1
+}
+
+profile_dir() {
+  local dir="$PROFILES_DIR/$1"
+  [[ -d "$dir" ]] || die "no profile '$1': create $dir with .env and model_mapping.json"
+  [[ -f "$dir/.env" ]] || die "profile '$1' has no .env: create $dir/.env"
+  [[ -f "$dir/model_mapping.json" ]] || die "profile '$1' has no model_mapping.json: create $dir/model_mapping.json"
+  echo "$dir"
+}
+
+profile_port() {
+  local port
+  port="$(sed -n 's/^PROXY_PORT=//p' "$1/.env" | tail -n 1 | tr -d "\"' ")"
+  [[ -n "$port" ]] || die "$1/.env sets no PROXY_PORT: add PROXY_PORT=<port>"
+  echo "$port"
+}
+
+compose() {
+  local name="$1" dir
+  shift
+  dir="$(profile_dir "$name")"
+  PROFILE_DIR="$dir" docker compose \
+    --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" \
+    --env-file "$dir/.env" -p "claude-proxy-$name" "$@"
+}
+
+is_running() {
+  [[ -n "$(compose "$1" ps --status running -q)" ]]
+}
+
+wait_for_port() {
+  local port="$1" attempt
+  for attempt in $(seq 1 60); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  die "nothing listens on 127.0.0.1:$port after 30s: run 'claude-proxy logs <name>'"
+}
+
+cmd_ls() {
+  local dir name state
+  printf '%-16s %-6s %s\n' PROFILE PORT STATE
+  for dir in "$PROFILES_DIR"/*/; do
+    [[ -f "${dir}.env" ]] || continue
+    name="$(basename "$dir")"
+    state=stopped
+    if is_running "$name"; then state=running; fi
+    printf '%-16s %-6s %s\n' "$name" "$(profile_port "${dir%/}")" "$state"
+  done
+}
+
+cmd_run() {
+  local name="$1" dir port
+  shift
+  dir="$(profile_dir "$name")"
+  port="$(profile_port "$dir")"
+  if ! is_running "$name"; then
+    compose "$name" up -d --build
+    wait_for_port "$port"
+  fi
+  ANTHROPIC_BASE_URL="http://127.0.0.1:$port" exec claude "$@"
+}
+
+[[ $# -ge 1 ]] || { usage >&2; exit 2; }
+command="$1"
+shift
+case "$command" in
+  ls) cmd_ls ;;
+  up) [[ $# -eq 1 ]] || die "usage: claude-proxy up <name>"; compose "$1" up -d --build ;;
+  down) [[ $# -eq 1 ]] || die "usage: claude-proxy down <name>"; compose "$1" down ;;
+  logs) [[ $# -eq 1 ]] || die "usage: claude-proxy logs <name>"; compose "$1" logs -f ;;
+  run) [[ $# -ge 1 ]] || die "usage: claude-proxy run <name> [claude args]"; cmd_run "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
