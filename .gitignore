@@ -45,3 +45,7 @@ docs/superpowers/
 
 # Local visual brainstorming sessions
 .superpowers/
+
+# Per-instance profiles hold credentials; only the example is tracked.
+profiles/*
+!profiles/example/

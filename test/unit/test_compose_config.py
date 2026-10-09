@@ -68,7 +68,8 @@ def test_compose_uses_repository_model_mapping_as_application_config(
     config = compose["configs"]["model_mapping"]
     grant = next(item for item in proxy["configs"] if item["source"] == "model_mapping")
 
-    assert config["file"] == "./model_mapping.json"
+    assert config["file"] == "${PROFILE_DIR:-.}/model_mapping.json"
+    assert proxy["env_file"] == "${PROFILE_DIR:-.}/.env"
     assert grant["target"] == "/claude-code-proxy/model_mapping.json"
     assert all("model_mapping.json" not in volume for volume in proxy.get("volumes", []))
 
@@ -79,7 +80,6 @@ def test_compose_uses_repository_model_mapping_as_application_config(
     )
     monkeypatch.delenv("MODEL_MAPPING_PATH", raising=False)
     assert grant["target"] == str(Path(workdir) / Settings.from_environment().model_mapping_path)
-    assert config["file"] == f"./{MAPPING_PATH.relative_to(ROOT)}"
 
     loaded = load_model_mapping(MAPPING_PATH)
     assert loaded.models["terra"].context_window == 1_000_000
@@ -160,3 +160,48 @@ def test_control_socket_remains_internal_to_container():
         serialized = yaml.safe_dump(volume)
         assert "/run/claude-code-proxy" not in serialized
         assert "control.sock" not in serialized
+
+
+def test_rendered_compose_reads_instance_files_from_profile_dir(tmp_path: Path):
+    profile = tmp_path / "profiles" / "z"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text("PROXY_PORT=9100\n")
+    (profile / "model_mapping.json").write_text("{}")
+    for name in ("docker-compose.yml", "Dockerfile", "pyproject.toml", "uv.lock", "README.md"):
+        shutil.copy2(ROOT / name, tmp_path / name)
+
+    completed = subprocess.run(
+        [
+            "docker", "compose",
+            "--project-directory", str(tmp_path),
+            "-f", str(tmp_path / "docker-compose.yml"),
+            "--env-file", str(profile / ".env"),
+            "-p", "claude-proxy-z",
+            "config", "--no-env-resolution",
+        ],
+        cwd=tmp_path,
+        env={"HOME": str(tmp_path), "PATH": os.environ["PATH"], "PROFILE_DIR": str(profile)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    rendered = yaml.safe_load(completed.stdout)
+
+    assert rendered["name"] == "claude-proxy-z"
+    assert rendered["configs"]["model_mapping"]["file"] == str(profile / "model_mapping.json")
+    assert rendered["services"]["proxy"]["environment"]["PROXY_PORT"] == "9100"
+
+
+def test_example_profile_is_loadable():
+    example = ROOT / "profiles" / "example"
+    env = dict(
+        line.split("=", maxsplit=1)
+        for line in (example / ".env.example").read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+
+    assert env["PROXY_PORT"].isdigit()
+    assert env["OPENAI_BASE_URL"] == '"https://api.z.ai/api/coding/paas/v4"'
+    mapping = load_model_mapping(example / "model_mapping.json")
+    assert set(mapping.mappings) == {"haiku", "sonnet", "opus", "fable"}

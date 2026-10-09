@@ -1,0 +1,26 @@
+{
+  "models": {
+    "glm-big": {
+      "target": "openai/glm-5.1",
+      "context_window": 200000,
+      "max_output_tokens": 98304,
+      "backend": "vllm"
+    },
+    "glm-small": {
+      "target": "openai/glm-4.5-air",
+      "context_window": 128000,
+      "max_output_tokens": 65536,
+      "backend": "vllm"
+    }
+  },
+  "tiers": {
+    "small": "glm-small",
+    "big": "glm-big"
+  },
+  "mappings": {
+    "haiku": { "tier": "small", "effort": "low" },
+    "sonnet": { "tier": "big", "effort": "medium" },
+    "opus": { "tier": "big", "effort": "high" },
+    "fable": { "tier": "big", "effort": "xhigh" }
+  }
+}

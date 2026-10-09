@@ -3,7 +3,7 @@ services:
     build: .
     command: ["claude-code-proxy", "proxy", "--performance", "collector"]
     restart: unless-stopped
-    env_file: .env
+    env_file: ${PROFILE_DIR:-.}/.env
     ports:
       - "127.0.0.1:${PROXY_PORT:-8082}:${PROXY_PORT:-8082}"
     volumes:
@@ -19,4 +19,4 @@ services:
 
 configs:
   model_mapping:
-    file: ./model_mapping.json
+    file: ${PROFILE_DIR:-.}/model_mapping.json
