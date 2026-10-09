@@ -949,3 +949,163 @@ async def test_text_between_tool_calls_is_emitted_after_the_tool_blocks():
         "message_stop",
     ]
     assert "now reading the file" in "".join(frames)
+
+
+def _thinking_frames(frames):
+    return [
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in frames
+        if frame.startswith("event: content_block_")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_thinking_then_text_streams_as_ordered_blocks():
+    from claude_code_proxy.domain.models import ThinkingDelta
+
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(
+            ThinkingDelta("think "),
+            ThinkingDelta("more"),
+            TextDelta("answer"),
+            StreamComplete("end_turn", TokenUsage(1, 1)),
+        ),
+    )]
+
+    blocks = _thinking_frames(frames)
+    assert [(b["type"], b["index"]) for b in blocks] == [
+        ("content_block_start", 0),
+        ("content_block_delta", 0),
+        ("content_block_delta", 0),
+        ("content_block_stop", 0),
+        ("content_block_start", 1),
+        ("content_block_delta", 1),
+        ("content_block_stop", 1),
+    ]
+    assert blocks[0]["content_block"] == {
+        "type": "thinking", "thinking": "", "signature": ""
+    }
+    assert [b["delta"] for b in blocks[1:3]] == [
+        {"type": "thinking_delta", "thinking": "think "},
+        {"type": "thinking_delta", "thinking": "more"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_thinking_then_tool_closes_thinking_before_tool():
+    from claude_code_proxy.domain.models import ThinkingDelta
+
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(
+            ThinkingDelta("plan"),
+            ToolUseStart("0", "call-1", "lookup"),
+            ToolUseEnd("0"),
+            StreamComplete("tool_use", TokenUsage(1, 1)),
+        ),
+    )]
+
+    assert [
+        (item["index"], item["content_block"]["type"])
+        for item in content_starts(frames)
+    ] == [(0, "thinking"), (1, "tool_use")]
+    names = event_names(frames)
+    assert names.index("content_block_stop") < names.index("content_block_start", 3)
+
+
+@pytest.mark.asyncio
+async def test_thinking_during_open_tool_block_is_dropped():
+    from claude_code_proxy.domain.models import ThinkingDelta
+
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(
+            ToolUseStart("0", "call-1", "lookup"),
+            ThinkingDelta("late"),
+            ToolUseEnd("0"),
+            StreamComplete("tool_use", TokenUsage(1, 1)),
+        ),
+    )]
+
+    assert [item["content_block"]["type"] for item in content_starts(frames)] == [
+        "tool_use"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_stream_has_no_empty_text_block():
+    from claude_code_proxy.domain.models import ThinkingDelta
+
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(
+            ThinkingDelta("hmm"),
+            StreamComplete("max_tokens", TokenUsage(1, 1)),
+        ),
+    )]
+
+    assert [item["content_block"]["type"] for item in content_starts(frames)] == [
+        "thinking"
+    ]
+
+
+def test_to_api_response_serializes_thinking():
+    from claude_code_proxy.domain.models import ThinkingBlock
+
+    response = to_api_response(CompletionResponse(
+        "id", "model", (ThinkingBlock("why"), TextBlock("because")),
+        "end_turn", TokenUsage(1, 1),
+    ))
+
+    assert response.model_dump()["content"] == [
+        {"type": "thinking", "thinking": "why", "signature": ""},
+        {"type": "text", "text": "because"},
+    ]
+
+
+def test_normalize_request_drops_echoed_thinking_blocks():
+    request = MessagesRequest(
+        model="model", max_tokens=10,
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "private", "signature": ""},
+                {"type": "text", "text": "hello"},
+            ]},
+            {"role": "user", "content": "again"},
+        ],
+    )
+
+    normalized = normalize_request(request)
+
+    assert normalized.messages[1].content == (TextBlock("hello"),)
+
+
+def test_normalize_request_drops_message_holding_only_thinking():
+    request = MessagesRequest(
+        model="model", max_tokens=10,
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "cut off"},
+            ]},
+            {"role": "user", "content": "again"},
+        ],
+    )
+
+    normalized = normalize_request(request)
+
+    assert [m.role for m in normalized.messages] == ["user", "user"]

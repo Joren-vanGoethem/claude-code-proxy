@@ -17,8 +17,8 @@ import litellm
 from ..config import Settings
 from ..domain.models import (
     CompletionRequest, CompletionResponse, ImageBlock, StreamComplete, StreamError,
-    StreamStart, TextBlock, TextDelta, TokenUsage, ToolInputDelta, ToolResultBlock,
-    ToolUseBlock, ToolUseEnd, ToolUseStart,
+    StreamStart, TextBlock, TextDelta, ThinkingBlock, ThinkingDelta, TokenUsage,
+    ToolInputDelta, ToolResultBlock, ToolUseBlock, ToolUseEnd, ToolUseStart,
 )
 from ..performance import (
     ProviderTelemetry,
@@ -78,6 +78,16 @@ def parse_tool_result_content(content: Any) -> str:
     return str(content)
 
 
+def _surfaces_reasoning(request: CompletionRequest) -> bool:
+    """Whether to pass a backend's `reasoning_content` on to the client.
+
+    LiteLLM reports reasoning for several providers under that one field, so
+    this is opt-in: only a `backend: "vllm"` target, and only when the request
+    turned reasoning on. Every other target keeps dropping it, as before.
+    """
+    return request.backend == "vllm" and request.reasoning.enabled is True
+
+
 @dataclass
 class _LiteLLMStreamState:
     usage: TokenUsage = field(default_factory=lambda: TokenUsage.unavailable())
@@ -85,6 +95,7 @@ class _LiteLLMStreamState:
     finish_seen: bool = False
     slots: set[str] = field(default_factory=set)
     terminal_error: StreamError | None = None
+    emit_reasoning: bool = False
 
     def feed(self, chunk) -> tuple:
         data = chunk if isinstance(chunk, dict) else chunk.model_dump()
@@ -95,6 +106,9 @@ class _LiteLLMStreamState:
         events = []
         for choice in data.get("choices", []):
             delta = choice.get("delta") or {}
+            reasoning = delta.get("reasoning_content")
+            if self.emit_reasoning and isinstance(reasoning, str) and reasoning:
+                events.append(ThinkingDelta(reasoning))
             if delta.get("content"):
                 events.append(TextDelta(delta["content"]))
             for index, call in enumerate(delta.get("tool_calls") or []):
@@ -387,6 +401,13 @@ class LiteLLMProvider:
         finish = choice.get("finish_reason", "stop") if isinstance(choice, dict) else getattr(choice, "finish_reason", "stop")
         usage = data.get("usage", {}) if isinstance(data, dict) else response.usage
         blocks = []
+        reasoning = (
+            message.get("reasoning_content")
+            if isinstance(message, dict)
+            else getattr(message, "reasoning_content", None)
+        )
+        if _surfaces_reasoning(request) and isinstance(reasoning, str) and reasoning:
+            blocks.append(ThinkingBlock(reasoning))
         if content_text:
             blocks.append(TextBlock(content_text))
         for call in tool_calls or []:
@@ -437,7 +458,9 @@ class LiteLLMProvider:
             yield stream_error_from_exception(error, provider=self.name)
             return
 
-        state = _LiteLLMStreamState()
+        state = _LiteLLMStreamState(
+            emit_reasoning=_surfaces_reasoning(request)
+        )
         external_exit = False
         try:
             yield StreamStart()

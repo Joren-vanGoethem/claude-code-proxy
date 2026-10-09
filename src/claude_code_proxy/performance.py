@@ -19,6 +19,8 @@ from .domain.models import (
     StreamEvent,
     TextBlock,
     TextDelta,
+    ThinkingBlock,
+    ThinkingDelta,
     TokenUsage,
     ToolUseBlock,
     ToolUseStart,
@@ -943,7 +945,7 @@ def validate_clock_sample(
 
 
 def _is_semantic_event(event: StreamEvent) -> bool:
-    if isinstance(event, TextDelta):
+    if isinstance(event, (TextDelta, ThinkingDelta)):
         return bool(event.text)
     return isinstance(event, (RedactedThinking, ToolUseStart))
 
@@ -951,6 +953,8 @@ def _is_semantic_event(event: StreamEvent) -> bool:
 def _is_meaningful_block(block: object) -> bool:
     if isinstance(block, TextBlock):
         return bool(block.text)
+    if isinstance(block, ThinkingBlock):
+        return bool(block.thinking)
     return isinstance(block, (RedactedThinkingBlock, ToolUseBlock))
 
 

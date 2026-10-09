@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import Any
 from ..domain.models import ClientIdentity, CompletionRequest, ImageBlock, Message, RedactedThinkingBlock, TextBlock, ToolChoice, ToolDefinition, ToolResultBlock, ToolUseBlock
 from ..reasoning import ReasoningPolicy
-from .schemas import ContentBlockImage, ContentBlockRedactedThinking, ContentBlockText, ContentBlockToolResult, ContentBlockToolUse, MessagesRequest
+from .schemas import ContentBlockImage, ContentBlockRedactedThinking, ContentBlockText, ContentBlockThinking, ContentBlockToolResult, ContentBlockToolUse, MessagesRequest
 
 
 def normalize_request(
@@ -19,7 +19,7 @@ def normalize_request(
         model=request.model,
         response_model=request.model,
         max_tokens=request.max_tokens,
-        messages=tuple(Message(role=message.role, content=_normalize_content(message.content)) for message in request.messages),
+        messages=_normalize_messages(request.messages),
         reasoning=ReasoningPolicy(None, None),
         client_identity=client_identity or ClientIdentity(),
         system=_normalize_system(request.system),
@@ -35,6 +35,17 @@ def normalize_request(
     )
 
 
+def _normalize_messages(messages: list[Any]) -> tuple[Message, ...]:
+    """Normalize messages, dropping any that held only client-echoed thinking."""
+    normalized = []
+    for message in messages:
+        content = _normalize_content(message.content)
+        if not content and message.content:
+            continue
+        normalized.append(Message(role=message.role, content=content))
+    return tuple(normalized)
+
+
 def _normalize_content(content: str | list[Any]):
     if isinstance(content, str):
         return (TextBlock(content),)
@@ -44,6 +55,11 @@ def _normalize_content(content: str | list[Any]):
             blocks.append(TextBlock(block.text))
         elif isinstance(block, ContentBlockImage):
             blocks.append(ImageBlock(deepcopy(block.source)))
+        elif isinstance(block, ContentBlockThinking):
+            # Plain thinking this proxy streamed earlier, echoed back by the
+            # client. It carries no signature a provider could verify and
+            # chat templates strip prior reasoning, so it is not replayed.
+            continue
         elif isinstance(block, ContentBlockRedactedThinking):
             blocks.append(RedactedThinkingBlock(block.data))
         elif isinstance(block, ContentBlockToolUse):
@@ -76,6 +92,8 @@ import uuid
 from ..domain.models import (
     CompletionResponse,
     RedactedThinking,
+    ThinkingBlock,
+    ThinkingDelta,
     StreamComplete,
     StreamError,
     StreamStart,
@@ -89,6 +107,7 @@ from ..failures import FailureCategory, FailureDiagnostic, FailureStage
 from .schemas import (
     ContentBlockRedactedThinking as ApiRedactedThinkingBlock,
     ContentBlockText as ApiTextBlock,
+    ContentBlockThinking as ApiThinkingBlock,
     ContentBlockToolUse as ApiToolUseBlock,
     MessagesResponse,
     OutputTokensDetails,
@@ -101,6 +120,12 @@ def to_api_response(response: CompletionResponse) -> MessagesResponse:
     for block in response.content:
         if isinstance(block, TextBlock):
             content.append(ApiTextBlock(type="text", text=block.text))
+        elif isinstance(block, ThinkingBlock):
+            content.append(
+                ApiThinkingBlock(
+                    type="thinking", thinking=block.thinking, signature=""
+                )
+            )
         elif isinstance(block, RedactedThinkingBlock):
             content.append(
                 ApiRedactedThinkingBlock(
@@ -218,6 +243,8 @@ class _AnthropicStreamState:
         self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
         self.text_index: int | None = None
         self.text_open = False
+        self.thinking_index: int | None = None
+        self.thinking_open = False
         self.tool_started = False
         self.tool_indices: dict[str, int] = {}
         self.open_tools: set[str] = set()
@@ -250,6 +277,8 @@ class _AnthropicStreamState:
             return []
         if isinstance(event, TextDelta):
             return self._text_delta(event)
+        if isinstance(event, ThinkingDelta):
+            return self._thinking_delta(event)
         if isinstance(event, RedactedThinking):
             return self._redacted_thinking(event)
         if isinstance(event, ToolUseStart):
@@ -273,7 +302,7 @@ class _AnthropicStreamState:
             # to nothing and never reaches the client.
             self.pending_text.append(event.text)
             return []
-        frames = []
+        frames = self._close_thinking()
         if not self.text_open:
             self.text_index = self._allocate_index()
             self.text_open = True
@@ -294,8 +323,35 @@ class _AnthropicStreamState:
         )
         return frames
 
-    def _redacted_thinking(self, event: RedactedThinking) -> list[str]:
+    def _thinking_delta(self, event: ThinkingDelta) -> list[str]:
+        if self.open_tools or not event.text:
+            # Reasoning cannot overlap an open tool block; it is dropped.
+            return []
         frames = self._close_text()
+        if not self.thinking_open:
+            self.thinking_index = self._allocate_index()
+            self.thinking_open = True
+            frames.append(
+                self._block_start(
+                    self.thinking_index,
+                    {"type": "thinking", "thinking": "", "signature": ""},
+                )
+            )
+        frames.append(
+            _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": self.thinking_index,
+                    "delta": {"type": "thinking_delta", "thinking": event.text},
+                },
+            )
+        )
+        return frames
+
+    def _redacted_thinking(self, event: RedactedThinking) -> list[str]:
+        frames = self._close_thinking()
+        frames.extend(self._close_text())
         index = self._allocate_index()
         frames.extend(
             [
@@ -311,7 +367,8 @@ class _AnthropicStreamState:
     def _tool_start(self, event: ToolUseStart) -> list[str]:
         if event.slot in self.tool_indices:
             raise ValueError(f"duplicate tool start for slot {event.slot}")
-        frames = self._close_text()
+        frames = self._close_thinking()
+        frames.extend(self._close_text())
         self.tool_started = True
         index = self._allocate_index()
         self.tool_indices[event.slot] = index
@@ -356,7 +413,8 @@ class _AnthropicStreamState:
     def finish(self, event: StreamComplete) -> list[str]:
         if self.open_tools:
             raise ValueError("stream completed with open tool blocks")
-        frames = self._close_text()
+        frames = self._close_thinking()
+        frames.extend(self._close_text())
         frames.extend(self._flush_pending_text())
         if self.next_index == 0:
             index = self._allocate_index()
@@ -422,6 +480,12 @@ class _AnthropicStreamState:
             ),
             self._block_stop(index),
         ]
+
+    def _close_thinking(self) -> list[str]:
+        if not self.thinking_open or self.thinking_index is None:
+            return []
+        self.thinking_open = False
+        return [self._block_stop(self.thinking_index)]
 
     def _close_text(self) -> list[str]:
         if not self.text_open or self.text_index is None:

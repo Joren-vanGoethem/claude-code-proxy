@@ -23,6 +23,16 @@ class RedactedThinkingBlock:
 
 
 @dataclass(frozen=True)
+class ThinkingBlock:
+    """Plain-text reasoning a backend reported next to its answer.
+
+    Response-only: it is never replayed upstream, so it is not a ContentBlock.
+    """
+
+    thinking: str
+
+
+@dataclass(frozen=True)
 class ToolUseBlock:
     id: str
     name: str
@@ -38,7 +48,9 @@ class ToolResultBlock:
 ContentBlock: TypeAlias = (
     TextBlock | ImageBlock | RedactedThinkingBlock | ToolUseBlock | ToolResultBlock
 )
-ResponseBlock: TypeAlias = TextBlock | RedactedThinkingBlock | ToolUseBlock
+ResponseBlock: TypeAlias = (
+    TextBlock | ThinkingBlock | RedactedThinkingBlock | ToolUseBlock
+)
 UsageField: TypeAlias = Literal[
     "input_tokens",
     "output_tokens",
@@ -167,6 +179,11 @@ class RedactedThinking:
 
 
 @dataclass(frozen=True)
+class ThinkingDelta:
+    text: str
+
+
+@dataclass(frozen=True)
 class ToolUseStart:
     slot: str
     id: str
@@ -203,6 +220,7 @@ class StreamError:
 StreamEvent: TypeAlias = (
     StreamStart
     | TextDelta
+    | ThinkingDelta
     | RedactedThinking
     | ToolUseStart
     | ToolInputDelta

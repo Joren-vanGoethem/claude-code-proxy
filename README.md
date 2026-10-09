@@ -379,6 +379,8 @@ Set `backend: "vllm"` for a self-hosted server that renders a strict chat templa
 
 The `vllm` profile also sends the conversation back using the OpenAI tool-call protocol: a past tool call travels in the assistant message's `tool_calls`, and its result travels as a `tool` message. The default profile flattens both into prose, which reads to a model as text it wrote itself, so it writes its next tool call as prose too and no parser recognises it as a call.
 
+The `vllm` profile also passes the server's reasoning on to the client. A server started with a reasoning parser, such as `--reasoning-parser qwen3` on vLLM or SGLang, returns the model's thinking in `reasoning_content`. When reasoning is enabled for the request, the proxy streams that field as an Anthropic `thinking` block, so the client sees progress during a long thinking phase. Other targets keep dropping the field. The proxy does not replay thinking blocks upstream, because they carry no signature a provider could verify; a client that sends them back has them ignored.
+
 Leave `backend` at `openai` for the OpenAI API and for any server that accepts a `system` message anywhere. The proxy then sends the messages exactly as the client wrote them, so a mid-conversation `system` message keeps its system authority.
 
 Tier values reference model-definition names. Each mapping selects exactly one model definition:
